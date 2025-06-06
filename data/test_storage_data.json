@@ -1,0 +1,27 @@
+{
+  "key": "test-storage-data",
+  "data": {
+    "config": {
+      "apiKey": "测试密钥",
+      "modelName": "gpt-3.5-turbo",
+      "timestamp": "2025-06-06T06:01:50.561Z"
+    },
+    "analysisData": [
+      {
+        "id": "test-1",
+        "url": "https://example.com",
+        "result": "Y",
+        "reason": "测试数据",
+        "status": "completed",
+        "createdAt": "2025-06-06T06:01:50.562Z",
+        "updatedAt": "2025-06-06T06:01:50.562Z"
+      }
+    ],
+    "backgroundTasks": [
+      "task-1",
+      "task-2"
+    ]
+  },
+  "timestamp": "2025-06-06T06:01:52.289Z",
+  "environment": "development"
+}

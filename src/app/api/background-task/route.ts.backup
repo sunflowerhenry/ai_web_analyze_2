@@ -1,0 +1,852 @@
+import type { NextRequest } from 'next/server'
+import { NextResponse } from 'next/server'
+import axios from 'axios'
+import * as cheerio from 'cheerio'
+
+// 从crawl API提取的爬虫逻辑
+async function crawlWebsite(url: string) {
+  let targetUrl: string
+  
+  try {
+    try {
+      const urlObj = new URL(url.startsWith('http') ? url : `https://${url}`)
+      targetUrl = urlObj.toString()
+    } catch (error) {
+      throw new Error(`URL格式不正确: ${url}`)
+    }
+    
+    // 爬取主页
+    const response = await axios.get(targetUrl, {
+      timeout: 15000, // 增加超时时间
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Accept-Encoding': 'gzip, deflate',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive'
+      },
+      maxRedirects: 3 // 允许重定向
+    })
+    
+    const $ = cheerio.load(response.data)
+    
+    // 优化内容提取
+    const title = $('title').text().trim() || $('h1').first().text().trim() || '无标题'
+    const description = $('meta[name="description"]').attr('content') || 
+                      $('meta[property="og:description"]').attr('content') || 
+                      $('meta[name="keywords"]').attr('content') || ''
+    
+    // 移除无用元素，保留有意义的内容
+    $('script, style, nav, header, footer, aside, .nav, .navigation, .menu, .sidebar, .breadcrumb, .pagination, .social, .share, .ad, .advertisement, iframe, noscript').remove()
+    
+    // 提取主要内容区域
+    let content = ''
+    
+    // 优先提取main、article、.content等主要内容区域
+    const mainContentSelectors = ['main', 'article', '.content', '.main-content', '.page-content', '.post-content', '#content', '#main']
+    let mainContent = ''
+    
+    for (const selector of mainContentSelectors) {
+      const element = $(selector)
+      if (element.length > 0) {
+        mainContent = element.text().trim()
+        break
+      }
+    }
+    
+    // 如果没找到主要内容区域，则提取body内容
+    if (!mainContent) {
+      mainContent = $('body').text().trim()
+    }
+    
+    // 清理和优化文本
+    content = mainContent
+      .replace(/\s+/g, ' ')           // 压缩空白字符
+      .replace(/\n{3,}/g, '\n\n')     // 压缩多余换行
+      .replace(/[^\w\s\u4e00-\u9fff\.\,\;\:\!\?\-\(\)\[\]]/g, ' ') // 保留中英文、数字和基本标点
+      .substring(0, 3000) // 增加内容长度限制，但不要太长影响AI分析
+    
+    // 额外提取关键信息
+    const keywords = $('meta[name="keywords"]').attr('content') || ''
+    const companyInfo = $('.company, .about, .intro, .description').text().trim().substring(0, 500)
+    
+    return { 
+      title, 
+      description, 
+      content,
+      keywords,
+      companyInfo,
+      url: targetUrl
+    }
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      if (error.code === 'ECONNABORTED') {
+        throw new Error('爬取超时，网站响应过慢')
+      } else if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND') {
+        throw new Error('无法连接到目标网站，请检查URL')
+      } else if (error.response?.status === 403) {
+        throw new Error('网站拒绝访问，可能存在反爬虫保护')
+      } else if (error.response?.status === 404) {
+        throw new Error('页面不存在')
+      } else if (error.response && error.response.status >= 500) {
+        throw new Error('目标服务器错误')
+      }
+    }
+    throw new Error(`爬取页面失败: ${error instanceof Error ? error.message : '未知错误'}`)
+  }
+}
+
+// 优化的AI分析逻辑
+async function analyzeWebsite(config: any, crawledContent: any) {
+  try {
+    if (!config.apiKey) {
+      throw new Error('API密钥未配置')
+    }
+    
+    if (!config.apiUrl) {
+      throw new Error('API地址未配置')
+    }
+    
+    if (!crawledContent || !crawledContent.content) {
+      throw new Error('没有可分析的内容')
+    }
+    
+    // 构建优化的分析提示词 - 使用结构化的markdown格式
+    const structuredContent = `
+# 网站分析报告
+
+## 基本信息
+- **网站标题**: ${crawledContent.title || '无标题'}
+- **网站描述**: ${crawledContent.description || '无描述'}
+- **关键词**: ${crawledContent.keywords || '无关键词'}
+- **网址**: ${crawledContent.url || '未知'}
+
+## 网站内容
+${crawledContent.content || '无内容'}
+
+## 公司信息
+${crawledContent.companyInfo || '无额外公司信息'}
+`
+    
+    // 使用优化的prompt
+    const optimizedPrompt = `请分析以下网站内容，判断这是否是一个目标客户网站。
+
+${structuredContent}
+
+请根据以下标准进行判断：
+1. 是否是企业官网或商业网站
+2. 是否有明确的业务介绍或产品服务
+3. 是否有联系方式或公司信息
+4. 网站内容是否专业完整
+5. 是否符合B2B客户特征
+
+请严格按照以下JSON格式回复（不要添加任何其他文字）：
+{
+  "result": "Y",
+  "reason": "详细的判断依据，包括网站类型、业务范围、专业程度等分析"
+}`
+    
+    // 调用AI分析 - 优化参数
+    const response = await axios.post(
+      config.apiUrl,
+      {
+        model: config.modelName,
+        messages: [
+          {
+            role: 'system',
+            content: '你是一个专业的网站分析助手，擅长判断网站是否属于目标客户。请严格按照JSON格式返回分析结果，不要添加任何额外说明。'
+          },
+          {
+            role: 'user',
+            content: optimizedPrompt
+          }
+        ],
+        temperature: 0.1, // 降低随机性，提高一致性
+        max_tokens: 800,  // 适当增加token数量
+        response_format: { type: "json_object" } // 如果API支持，强制JSON格式
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${config.apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 45000 // 增加超时时间
+      }
+    )
+    
+    const aiResponse = response.data.choices[0]?.message?.content
+    if (!aiResponse) {
+      throw new Error('AI返回空响应')
+    }
+    
+    // 改进的JSON解析
+    try {
+      // 清理可能的markdown格式
+      const cleanedResponse = aiResponse
+        .replace(/```json\s*/g, '')
+        .replace(/```\s*/g, '')
+        .trim()
+      
+      const parsed = JSON.parse(cleanedResponse)
+      
+      return {
+        result: parsed.result === 'Y' ? 'Y' : 'N',
+        reason: (parsed.reason || '无具体原因').substring(0, 500), // 限制原因长度
+        confidence: parsed.confidence || null // 如果AI返回了置信度
+      }
+    } catch (parseError) {
+      console.warn('JSON解析失败，尝试文本提取:', aiResponse)
+      
+      // 更强健的文本提取
+      const resultMatch = aiResponse.match(/["\s]*result["\s]*:\s*["\s]*(Y|N)["\s]*/i)
+      const reasonMatch = aiResponse.match(/["\s]*reason["\s]*:\s*["\s]*([^"]+)["\s]*/i)
+      
+      if (resultMatch) {
+        return {
+          result: resultMatch[1].toUpperCase() as 'Y' | 'N',
+          reason: reasonMatch ? reasonMatch[1].substring(0, 500) : aiResponse.substring(0, 300)
+        }
+      } else {
+        // 最后的fallback
+        return {
+          result: 'N' as const,
+          reason: `AI响应解析失败，原始响应: ${aiResponse.substring(0, 200)}`
+        }
+      }
+    }
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      if (error.response?.status === 401) {
+        throw new Error('API密钥无效，请检查配置')
+      } else if (error.response?.status === 429) {
+        throw new Error('API调用频率超限，请稍后重试')
+      } else if (error.response?.status === 400) {
+        throw new Error('请求参数错误，请检查模型名称和API地址')
+      } else if (error.code === 'ECONNABORTED') {
+        throw new Error('AI分析超时，请稍后重试')
+      }
+    }
+    throw new Error(`AI分析失败: ${error instanceof Error ? error.message : '未知错误'}`)
+  }
+}
+
+// 内存中的任务队列 (生产环境应该使用Redis或数据库)
+const backgroundTasks = new Map<string, {
+  id: string
+  type: 'analyze' | 'crawl'
+  urls: string[]
+  config: any
+  status: 'pending' | 'running' | 'completed' | 'failed'
+  progress: { current: number; total: number }
+  results: any[]
+  errors: any[]
+  currentlyProcessing: string[] // 正在处理的URL
+  createdAt: Date
+  startedAt?: Date
+  completedAt?: Date
+}>()
+
+// 正在运行的任务处理器
+const runningTasks = new Map<string, {
+  abortController: AbortController
+  promise: Promise<void>
+}>()
+
+// 内存管理配置
+const MEMORY_CONFIG = {
+  MAX_TASKS: 50,              // 最大任务数量
+  MAX_RESULTS_PER_TASK: 1000,  // 增加每个任务最大结果数，支持大批量
+  MAX_ERRORS_PER_TASK: 500,   // 增加每个任务最大错误数
+  CLEANUP_INTERVAL: 5 * 60 * 1000, // 5分钟清理一次，更频繁
+  TASK_RETENTION_TIME: 7 * 24 * 60 * 60 * 1000, // 任务保留7天，支持长期查看结果
+  BATCH_SIZE: 50,             // 分批处理大小，每批50个URL
+  BATCH_DELAY: 500,           // 批次间延迟500ms，平衡速度和稳定性
+  MEMORY_CHECK_INTERVAL: 100, // 每100个URL检查一次内存
+}
+
+// 内存使用检查
+function checkMemoryUsage() {
+  const usage = process.memoryUsage()
+  const heapUsedMB = usage.heapUsed / 1024 / 1024
+  const rssMB = usage.rss / 1024 / 1024
+  
+  return {
+    heapUsedMB,
+    rssMB,
+    isHighMemory: heapUsedMB > 400 || rssMB > 500, // 400MB堆内存或500MB RSS
+    shouldCleanup: heapUsedMB > 300 || rssMB > 400  // 300MB堆内存或400MB RSS时开始清理
+  }
+}
+
+// 自动清理函数
+function performMemoryCleanup() {
+  const now = new Date()
+  const cutoffTime = new Date(now.getTime() - MEMORY_CONFIG.TASK_RETENTION_TIME)
+  
+  let cleanedTasks = 0
+  let cleanedResults = 0
+  let cleanedErrors = 0
+  
+  // 清理过期的已完成任务
+  for (const [taskId, task] of backgroundTasks.entries()) {
+    if (
+      (task.status === 'completed' || task.status === 'failed') &&
+      task.completedAt &&
+      task.completedAt < cutoffTime
+    ) {
+      backgroundTasks.delete(taskId)
+      cleanedTasks++
+      continue
+    }
+    
+    // 清理任务中过多的结果和错误记录
+    if (task.results.length > MEMORY_CONFIG.MAX_RESULTS_PER_TASK) {
+      const excessResults = task.results.length - MEMORY_CONFIG.MAX_RESULTS_PER_TASK
+      task.results = task.results.slice(-MEMORY_CONFIG.MAX_RESULTS_PER_TASK) // 保留最新的
+      cleanedResults += excessResults
+    }
+    
+    if (task.errors.length > MEMORY_CONFIG.MAX_ERRORS_PER_TASK) {
+      const excessErrors = task.errors.length - MEMORY_CONFIG.MAX_ERRORS_PER_TASK
+      task.errors = task.errors.slice(-MEMORY_CONFIG.MAX_ERRORS_PER_TASK) // 保留最新的
+      cleanedErrors += excessErrors
+    }
+  }
+  
+  // 如果任务总数超过限制，删除最老的已完成任务
+  if (backgroundTasks.size > MEMORY_CONFIG.MAX_TASKS) {
+    const completedTasks = Array.from(backgroundTasks.entries())
+      .filter(([_, task]) => task.status === 'completed' || task.status === 'failed')
+      .sort(([_, a], [__, b]) => (a.completedAt?.getTime() || 0) - (b.completedAt?.getTime() || 0))
+    
+    const tasksToDelete = completedTasks.slice(0, backgroundTasks.size - MEMORY_CONFIG.MAX_TASKS)
+    tasksToDelete.forEach(([taskId]) => {
+      backgroundTasks.delete(taskId)
+      cleanedTasks++
+    })
+  }
+  
+  if (cleanedTasks > 0 || cleanedResults > 0 || cleanedErrors > 0) {
+    console.log(`[MemoryCleanup] 清理完成: 任务=${cleanedTasks}, 结果=${cleanedResults}, 错误=${cleanedErrors}, 剩余任务=${backgroundTasks.size}`)
+  }
+}
+
+// 启动定期清理
+setInterval(performMemoryCleanup, MEMORY_CONFIG.CLEANUP_INTERVAL)
+
+// 在任务完成时也进行轻量清理
+function lightweightCleanup() {
+  const now = new Date()
+  const cutoffTime = new Date(now.getTime() - MEMORY_CONFIG.TASK_RETENTION_TIME)
+  
+  // 只清理明显过期的任务
+  for (const [taskId, task] of backgroundTasks.entries()) {
+    if (
+      (task.status === 'completed' || task.status === 'failed') &&
+      task.completedAt &&
+      task.completedAt < cutoffTime &&
+      Math.random() < 0.1 // 10%的概率执行清理，避免频繁操作
+    ) {
+      backgroundTasks.delete(taskId)
+      break // 每次只清理一个
+    }
+  }
+}
+
+// 后台任务处理函数（优化大批量处理）
+async function processBackgroundTask(taskId: string) {
+  const task = backgroundTasks.get(taskId)
+  if (!task) return
+
+  // 验证配置缓存 - 输出关键配置信息（不包含敏感的API密钥）
+  console.log(`[BackgroundTask ${taskId.substring(0, 8)}] Starting with cached config:`, {
+    hasApiKey: !!task.config?.apiKey,
+    apiUrl: task.config?.apiUrl,
+    modelName: task.config?.modelName,
+    urlCount: task.urls.length,
+    estimatedTime: `${Math.ceil(task.urls.length / 60)} 分钟` // 预估时间（每分钟60个URL）
+  })
+
+  task.status = 'running'
+  task.startedAt = new Date()
+
+  try {
+    const abortController = new AbortController()
+    
+    const taskPromise = (async () => {
+      const totalUrls = task.urls.length
+      const batchSize = task.urls.length > 1000 ? MEMORY_CONFIG.BATCH_SIZE : 10 // 大批量时使用更大的批次
+      
+      console.log(`[BackgroundTask ${taskId.substring(0, 8)}] 开始分批处理 ${totalUrls} 个URL，批次大小: ${batchSize}`)
+      
+      for (let batchStart = 0; batchStart < totalUrls; batchStart += batchSize) {
+        if (abortController.signal.aborted) break
+
+        const batchEnd = Math.min(batchStart + batchSize, totalUrls)
+        const currentBatch = task.urls.slice(batchStart, batchEnd)
+        
+        console.log(`[BackgroundTask ${taskId.substring(0, 8)}] 处理批次 ${Math.floor(batchStart/batchSize) + 1}/${Math.ceil(totalUrls/batchSize)} (URLs ${batchStart + 1}-${batchEnd})`)
+        
+        // 检查内存使用
+        if (batchStart > 0 && batchStart % (MEMORY_CONFIG.MEMORY_CHECK_INTERVAL * batchSize) === 0) {
+          const memoryStatus = checkMemoryUsage()
+          console.log(`[BackgroundTask ${taskId.substring(0, 8)}] 内存检查: Heap=${memoryStatus.heapUsedMB.toFixed(1)}MB, RSS=${memoryStatus.rssMB.toFixed(1)}MB`)
+          
+          if (memoryStatus.shouldCleanup) {
+            console.log(`[BackgroundTask ${taskId.substring(0, 8)}] 触发内存清理`)
+            performMemoryCleanup()
+            
+            // 如果内存使用过高，增加延迟
+            if (memoryStatus.isHighMemory) {
+              console.log(`[BackgroundTask ${taskId.substring(0, 8)}] 高内存使用，暂停3秒`)
+              await new Promise(resolve => setTimeout(resolve, 3000))
+            }
+          }
+        }
+
+        // 并发处理当前批次
+        const batchPromises = currentBatch.map(async (url, index) => {
+          if (abortController.signal.aborted) return
+
+          const globalIndex = batchStart + index
+          if (!url) return // 跳过空URL
+          
+          try {
+            // 更新进度和当前处理状态
+            task.progress = { current: globalIndex + 1, total: totalUrls }
+            
+            // 限制并发数量，避免同时处理太多
+            const concurrentLimit = task.urls.length > 5000 ? 3 : 5
+            if (index >= concurrentLimit) {
+              await new Promise(resolve => setTimeout(resolve, index * 200)) // 交错延迟
+            }
+            
+            task.currentlyProcessing = task.currentlyProcessing || []
+            task.currentlyProcessing.push(url)
+
+            // 爬取网站 - 直接调用函数
+            const crawlData = await crawlWebsite(url)
+
+            // AI分析
+            if (task.type === 'analyze') {
+              const analyzeData = await analyzeWebsite(task.config, crawlData)
+
+              task.results.push({
+                url,
+                crawlData: {
+                  title: crawlData.title,
+                  description: crawlData.description,
+                  // 限制内容长度，避免内存过载
+                  content: crawlData.content?.substring(0, 500),
+                  url: crawlData.url
+                },
+                analyzeData,
+                completedAt: new Date()
+              })
+            } else {
+              task.results.push({
+                url,
+                crawlData: {
+                  title: crawlData.title,
+                  description: crawlData.description,
+                  content: crawlData.content?.substring(0, 500),
+                  url: crawlData.url
+                },
+                completedAt: new Date()
+              })
+            }
+
+            // 处理完成，从正在处理列表中移除
+            task.currentlyProcessing = task.currentlyProcessing.filter(u => u !== url)
+
+          } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : '未知错误'
+            
+            // 根据错误类型分类
+            let errorType: 'crawl_error' | 'ai_error' | 'network_error' | 'timeout_error' | 'config_error' | 'unknown_error' = 'unknown_error'
+            let stage: 'crawling' | 'ai_analysis' | 'info_extraction' | 'initialization' = 'crawling'
+            
+            if (errorMessage.includes('爬取') || errorMessage.includes('连接') || errorMessage.includes('页面不存在')) {
+              errorType = 'crawl_error'
+              stage = 'crawling'
+            } else if (errorMessage.includes('API') || errorMessage.includes('分析')) {
+              errorType = 'ai_error'
+              stage = 'ai_analysis'
+            } else if (errorMessage.includes('超时')) {
+              errorType = 'timeout_error'
+            } else if (errorMessage.includes('配置') || errorMessage.includes('密钥')) {
+              errorType = 'config_error'
+            }
+            
+            task.errors.push({
+              url,
+              stage,
+              type: errorType,
+              message: errorMessage,
+              timestamp: new Date()
+            })
+            
+            // 处理失败，从正在处理列表中移除
+            if (task.currentlyProcessing) {
+              task.currentlyProcessing = task.currentlyProcessing.filter(u => u !== url)
+            }
+          }
+        })
+
+        // 等待当前批次完成
+        await Promise.allSettled(batchPromises)
+        
+        // 批次间延迟，避免过于频繁的请求
+        if (batchEnd < totalUrls) {
+          const delay = task.urls.length > 5000 ? MEMORY_CONFIG.BATCH_DELAY * 2 : MEMORY_CONFIG.BATCH_DELAY
+          await new Promise(resolve => setTimeout(resolve, delay))
+        }
+        
+        // 定期清理结果，避免内存积累
+        if (task.results.length > MEMORY_CONFIG.MAX_RESULTS_PER_TASK) {
+          console.log(`[BackgroundTask ${taskId.substring(0, 8)}] 清理过多结果: ${task.results.length} -> ${MEMORY_CONFIG.MAX_RESULTS_PER_TASK}`)
+          task.results = task.results.slice(-MEMORY_CONFIG.MAX_RESULTS_PER_TASK)
+        }
+        
+        if (task.errors.length > MEMORY_CONFIG.MAX_ERRORS_PER_TASK) {
+          console.log(`[BackgroundTask ${taskId.substring(0, 8)}] 清理过多错误: ${task.errors.length} -> ${MEMORY_CONFIG.MAX_ERRORS_PER_TASK}`)
+          task.errors = task.errors.slice(-MEMORY_CONFIG.MAX_ERRORS_PER_TASK)
+        }
+      }
+      
+      console.log(`[BackgroundTask ${taskId.substring(0, 8)}] 所有批次处理完成`)
+    })()
+
+    runningTasks.set(taskId, { abortController, promise: taskPromise })
+    await taskPromise
+
+    task.status = 'completed'
+    task.completedAt = new Date()
+    task.currentlyProcessing = [] // 清空正在处理的列表
+
+    // 最终统计
+    const successCount = task.results.length
+    const errorCount = task.errors.length
+    const totalTime = task.completedAt.getTime() - (task.startedAt?.getTime() || 0)
+    
+    console.log(`[BackgroundTask ${taskId.substring(0, 8)}] 任务完成统计:`, {
+      总数: task.urls.length,
+      成功: successCount,
+      失败: errorCount,
+      成功率: `${((successCount / task.urls.length) * 100).toFixed(1)}%`,
+      总耗时: `${Math.floor(totalTime / 1000 / 60)} 分钟 ${Math.floor((totalTime / 1000) % 60)} 秒`
+    })
+
+    // 执行轻量清理
+    lightweightCleanup()
+
+  } catch (error) {
+    task.status = 'failed'
+    task.completedAt = new Date()
+    task.currentlyProcessing = [] // 清空正在处理的列表
+    task.errors.push({
+      stage: 'task_execution',
+      type: 'unknown_error',
+      message: error instanceof Error ? error.message : '任务执行失败',
+      timestamp: new Date()
+    })
+
+    console.error(`[BackgroundTask ${taskId.substring(0, 8)}] 任务执行失败:`, error)
+
+    // 执行轻量清理
+    lightweightCleanup()
+  } finally {
+    runningTasks.delete(taskId)
+  }
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const { action, taskId, urls, config, type } = await request.json()
+
+    switch (action) {
+      case 'create': {
+        if (!urls || !Array.isArray(urls) || urls.length === 0) {
+          return NextResponse.json({ error: '缺少URL列表' }, { status: 400 })
+        }
+
+        // 检查是否有正在运行或等待的任务
+        const existingTask = Array.from(backgroundTasks.values()).find(task => 
+          task.status === 'pending' || task.status === 'running'
+        )
+
+        if (existingTask) {
+          // 向现有任务添加URL
+          existingTask.urls.push(...urls)
+          existingTask.progress.total = existingTask.urls.length
+
+          return NextResponse.json({
+            taskId: existingTask.id,
+            message: `已向现有任务添加 ${urls.length} 个URL`,
+            status: 'added_to_existing',
+            totalUrls: existingTask.urls.length
+          })
+        } else {
+          // 创建新任务
+          const newTaskId = crypto.randomUUID()
+          const task = {
+            id: newTaskId,
+            type: type || 'analyze',
+            urls,
+            config,
+            status: 'pending' as const,
+            progress: { current: 0, total: urls.length },
+            results: [],
+            errors: [],
+            currentlyProcessing: [],
+            createdAt: new Date()
+          }
+
+          backgroundTasks.set(newTaskId, task)
+
+          // 立即开始处理任务
+          processBackgroundTask(newTaskId)
+
+          return NextResponse.json({
+            taskId: newTaskId,
+            message: '后台任务已创建并开始执行',
+            status: 'created'
+          })
+        }
+      }
+
+      case 'status': {
+        if (!taskId) {
+          return NextResponse.json({ error: '缺少任务ID' }, { status: 400 })
+        }
+
+        const task = backgroundTasks.get(taskId)
+        if (!task) {
+          return NextResponse.json({ error: '任务不存在' }, { status: 404 })
+        }
+
+        return NextResponse.json({
+          taskId,
+          status: task.status,
+          progress: task.progress,
+          resultsCount: task.results.length,
+          errorsCount: task.errors.length,
+          createdAt: task.createdAt,
+          startedAt: task.startedAt,
+          completedAt: task.completedAt
+        })
+      }
+
+      case 'results': {
+        if (!taskId) {
+          return NextResponse.json({ error: '缺少任务ID' }, { status: 400 })
+        }
+
+        const task = backgroundTasks.get(taskId)
+        if (!task) {
+          return NextResponse.json({ error: '任务不存在' }, { status: 404 })
+        }
+
+        return NextResponse.json({
+          taskId,
+          status: task.status,
+          progress: task.progress,
+          results: task.results,
+          errors: task.errors,
+          currentlyProcessing: task.currentlyProcessing,
+          summary: {
+            total: task.urls.length,
+            completed: task.results.length,
+            failed: task.errors.length,
+            processing: task.currentlyProcessing.length
+          }
+        })
+      }
+
+      case 'realtime-status': {
+        if (!taskId) {
+          return NextResponse.json({ error: '缺少任务ID' }, { status: 400 })
+        }
+
+        const task = backgroundTasks.get(taskId)
+        if (!task) {
+          return NextResponse.json({ error: '任务不存在' }, { status: 404 })
+        }
+
+        // 返回实时状态信息
+        return NextResponse.json({
+          taskId,
+          status: task.status,
+          progress: task.progress,
+          currentlyProcessing: task.currentlyProcessing,
+          recentResults: task.results.slice(-5), // 最近5个结果
+          recentErrors: task.errors.slice(-5),   // 最近5个错误
+          summary: {
+            total: task.urls.length,
+            completed: task.results.length,
+            failed: task.errors.length,
+            remaining: task.urls.length - task.results.length - task.errors.length
+          }
+        })
+      }
+
+      case 'cancel': {
+        if (!taskId) {
+          return NextResponse.json({ error: '缺少任务ID' }, { status: 400 })
+        }
+
+        const task = backgroundTasks.get(taskId)
+        if (!task) {
+          return NextResponse.json({ error: '任务不存在' }, { status: 404 })
+        }
+
+        const runningTask = runningTasks.get(taskId)
+        if (runningTask) {
+          runningTask.abortController.abort()
+          runningTasks.delete(taskId)
+        }
+
+        task.status = 'failed'
+        task.completedAt = new Date()
+        task.errors.push({
+          stage: 'task_execution',
+          type: 'unknown_error',
+          message: '任务被用户取消',
+          timestamp: new Date()
+        })
+
+        return NextResponse.json({
+          taskId,
+          message: '任务已取消',
+          status: 'cancelled'
+        })
+      }
+
+      case 'config-check': {
+        if (!taskId) {
+          return NextResponse.json({ error: '缺少任务ID' }, { status: 400 })
+        }
+
+        const task = backgroundTasks.get(taskId)
+        if (!task) {
+          return NextResponse.json({ error: '任务不存在' }, { status: 404 })
+        }
+
+        // 返回配置状态（不包含敏感信息）
+        return NextResponse.json({
+          taskId,
+          configStatus: {
+            hasApiKey: !!task.config?.apiKey,
+            apiKeyLength: task.config?.apiKey?.length || 0,
+            apiUrl: task.config?.apiUrl,
+            modelName: task.config?.modelName,
+            hasProxySettings: !!task.config?.proxySettings,
+            hasConcurrencySettings: !!task.config?.concurrencySettings,
+            hasAntiDetectionSettings: !!task.config?.antiDetectionSettings
+          },
+          message: 'API配置已缓存在后台任务中'
+        })
+      }
+
+      case 'list': {
+        const taskList = Array.from(backgroundTasks.values()).map(task => ({
+          id: task.id,
+          type: task.type,
+          status: task.status,
+          progress: task.progress,
+          urlCount: task.urls.length,
+          resultsCount: task.results.length,
+          errorsCount: task.errors.length,
+          createdAt: task.createdAt,
+          startedAt: task.startedAt,
+          completedAt: task.completedAt
+        })).sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+
+        return NextResponse.json({ tasks: taskList })
+      }
+
+      case 'cleanup': {
+        // 清理已完成的旧任务 (超过1小时)
+        const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000)
+        let cleaned = 0
+
+        for (const [id, task] of backgroundTasks.entries()) {
+          if (task.status === 'completed' && task.completedAt && task.completedAt < oneHourAgo) {
+            backgroundTasks.delete(id)
+            cleaned++
+          }
+        }
+
+        return NextResponse.json({
+          message: `已清理${cleaned}个过期任务`,
+          remaining: backgroundTasks.size
+        })
+      }
+
+      default:
+        return NextResponse.json({ error: '无效的操作类型' }, { status: 400 })
+    }
+
+  } catch (error) {
+    return NextResponse.json({
+      error: `后台任务处理失败: ${error instanceof Error ? error.message : '未知错误'}`
+    }, { status: 500 })
+  }
+}
+
+export async function GET(request: NextRequest) {
+  try {
+    const { searchParams } = new URL(request.url)
+    const taskId = searchParams.get('taskId')
+
+    if (taskId) {
+      // 获取特定任务状态
+      const task = backgroundTasks.get(taskId)
+      if (!task) {
+        return NextResponse.json({ error: '任务不存在' }, { status: 404 })
+      }
+
+      return NextResponse.json({
+        taskId,
+        status: task.status,
+        progress: task.progress,
+        resultsCount: task.results.length,
+        errorsCount: task.errors.length,
+        createdAt: task.createdAt,
+        startedAt: task.startedAt,
+        completedAt: task.completedAt
+      })
+    } else {
+      // 获取所有任务列表
+      const taskList = Array.from(backgroundTasks.values()).map(task => ({
+        id: task.id,
+        type: task.type,
+        status: task.status,
+        progress: task.progress,
+        urlCount: task.urls.length,
+        resultsCount: task.results.length,
+        errorsCount: task.errors.length,
+        createdAt: task.createdAt,
+        startedAt: task.startedAt,
+        completedAt: task.completedAt
+      })).sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+
+      return NextResponse.json({ 
+        tasks: taskList,
+        summary: {
+          total: taskList.length,
+          running: taskList.filter(t => t.status === 'running').length,
+          pending: taskList.filter(t => t.status === 'pending').length,
+          completed: taskList.filter(t => t.status === 'completed').length,
+          failed: taskList.filter(t => t.status === 'failed').length
+        }
+      })
+    }
+
+  } catch (error) {
+    return NextResponse.json({
+      error: `获取任务状态失败: ${error instanceof Error ? error.message : '未知错误'}`
+    }, { status: 500 })
+  }
+} 
